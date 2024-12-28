@@ -2,71 +2,6 @@
 
 set -e  # Arrêter le script en cas d'erreur
 
-# Nettoyage des processus en cas d'erreur ou d'interruption
-#trap "pkill -f guitarix || true" EXIT
-
-# TODO: Ajouter une fonction pour détecter les périphériques de sortie audio
-#       - Cette fonction devra lister les périphériques disponibles avec pw-jack et permettre à l'utilisateur de choisir.
-
-# Fonction pour récupérer les périphériques de capture
-get_capture_devices() {
-    pw-jack jack_lsp | grep -E "capture" | grep -v "Midi" | sed 's/^[ \t]*//'
-}
-
-# Récupérer les périphériques disponibles
-capture_devices=$(get_capture_devices)
-
-# Vérifier qu'il y a des périphériques disponibles
-if [ -z "$capture_devices" ]; then
-    zenity --error --text="Aucun périphérique de capture détecté !" --width=300
-    exit 1
-fi
-
-# Convertir les périphériques en une liste utilisable par Zenity
-formatted_devices=$(echo "$capture_devices" | awk '{print NR ": " $0}' | sed 's/ /+/g')
-
-# Afficher le menu pour sélectionner un périphérique
-selected=$(zenity --entry --title="Sélectionnez un périphérique" \
-    --text="Choisissez un périphérique de capture dans le menu ci-dessous :" \
-    --width=600\
-    --entry-text=$(echo "$formatted_devices"))
-
-# TODO: Ajouter une vérification stricte des entrées utilisateur pour éviter les erreurs inattendues.
-
-# Vérifier si l'utilisateur a annulé
-if [ $? -ne 0 ]; then
-    zenity --info --text="Annulation par l'utilisateur." --width=300
-    exit 1
-fi
-
-# Valider la sélection pour s'assurer qu'elle est correcte
-if ! [[ $(echo "$selected" | tr '_' ' ' | awk -F':+' '{print $1}') =~ ^[0-9]+$ ]]; then
-    zenity --error --text="Entrée invalide. Veuillez entrer un numéro valide." --width=300
-    exit 1
-fi
-
-# TODO: Traiter correctement les caractères spéciaux dans les noms de périphériques pour éviter les problèmes lors des connexions.
-
-# Extraire le périphérique sélectionné
-selected_device=$(echo "$selected" | tr '+' ' ' | awk -F': ' '{print $2}')
-
-# Vérifier que le périphérique a bien été récupéré
-if [ -z "$selected_device" ]; then
-    zenity --error --text="Le périphérique sélectionné n'existe pas." --width=300
-    exit 1
-fi
-
-# Afficher le périphérique sélectionné
-zenity --info --text="Vous avez sélectionné : $selected_device" --width=300
-
-# TODO: Ajouter des profils enregistrés pour simplifier la configuration (ex. casque, haut-parleurs, etc.).
-
-# Nom des ports (entrée guitare et sortie Guitarix)
-INPUT_PORT="$selected_device"
-GX_HEAD_AMP_INPUT="gx_head_amp:in_0"
-GX_HEAD_FX_OUTPUT_L="gx_head_fx:out_0"
-GX_HEAD_FX_OUTPUT_R="gx_head_fx:out_1"
-
 # Fonction pour détecter les ports JACK
 detect_jack_ports() {
     echo "Tentative de détection avec les ports $1 et $2..."
@@ -84,53 +19,115 @@ detect_jack_ports() {
     fi
 }
 
+# Fonction pour récupérer les périphériques de capture
+get_capture_devices() {
+    pw-jack jack_lsp | grep -E "capture" | grep -v "Midi" | sed 's/^[ \t]*//'
+}
+
 # Fonction pour déconnecter toutes les connexions existantes
 disconnect_all_ports() {
     echo "Déconnexion de toutes les connexions existantes..."
-    # Déconnecter toutes les connexions Guitarix -> périphériques
     pw-jack jack_lsp | grep -E "capture|playback|output" | while read -r PORT; do
         CONNECTED_PORTS=$(pw-jack jack_lsp -c "$PORT" | awk '{print $1}' | tr -d '\r')
         for CONNECTED_PORT in $CONNECTED_PORTS; do
-            if pw-jack jack_disconnect "$PORT" "$CONNECTED_PORT" 2>/dev/null; then
-                echo "Déconnecté : $PORT -> $CONNECTED_PORT"
-            fi
+            pw-jack jack_disconnect "$PORT" "$CONNECTED_PORT" 2>/dev/null || true
         done
     done
     echo "Toutes les connexions précédentes ont été déconnectées."
 }
 
-# Vérifier si Guitarix est déjà en cours d'exécution
-if pgrep -x "guitarix" > /dev/null; then
-    echo "Guitarix est déjà en cours d'exécution. Aucun besoin de le relancer."
-else
-    echo "Lancement de Guitarix..."
-    pw-jack guitarix &
-    sleep 2  # Attendre un instant pour s'assurer que les ports sont chargés
-fi
+# Connexion automatique pour plusieurs ports
+connect_ports() {
+    local src_port="$1"
+    local dst_port="$2"
+    if ! pw-jack jack_lsp -c "$src_port" | grep -q "$dst_port"; then
+        if ! pw-jack jack_connect "$src_port" "$dst_port"; then
+            zenity --error --text="Erreur lors de la connexion : $src_port -> $dst_port" --width=300
+            zenity --question --text="Voulez-vous réessayer ?" --width=300
+            if [ $? -eq 0 ]; then
+                exec "$0"
+            else
+                exit 1
+            fi
+        else
+            echo "Connexion réussie : $src_port -> $dst_port"
+        fi
+    else
+        echo "Connexion déjà existante : $src_port -> $dst_port"
+    fi
+}
 
-# TODO: Ajouter une vérification pour s'assurer que Guitarix s'est lancé correctement.
+# Fonction pour normaliser les noms des ports (remplacement des caractères spéciaux)
+normalize_port_name() {
+    echo "$1" | sed 's/:/\*\*/g'
+}
 
-# Détecter le périphérique de sortie par défaut
-DEFAULT_SINK=$(pactl get-default-sink)
-echo "Nom interne du périphérique par défaut : $DEFAULT_SINK"
+# Fonction pour retrouver le nom d'origine (en utilisant un tableau associatif si nécessaire)
+denormalize_port_name() {
+    echo "$1" | sed 's/\*\*/:/g'
+}
 
-# TODO: Ajouter une option pour sélectionner manuellement le périphérique de sortie si nécessaire.
-
-# Récupérer le nom descriptif du périphérique (nettoyé)
-DESCRIPTIVE_NAME=$(pactl list sinks | grep -A 5 -E "$DEFAULT_SINK" | grep -E "Description*" | cut -d ":" -f 2 | sed 's/^ *//')
-
-# Déconnecter les précédentes sorties
-disconnect_all_ports
-
-# Stocker le périphérique actuel pour la prochaine exécution
-echo "$DESCRIPTIVE_NAME" > /tmp/previous_device_name
-
-# Vérifier que la description est trouvée
-if [ -z "$DESCRIPTIVE_NAME" ]; then
-    echo "Erreur : La description du périphérique audio n'a pas pu être trouvée."
+# Détection des périphériques disponibles
+capture_devices=$(get_capture_devices)
+if [ -z "$capture_devices" ]; then
+    zenity --error --text="Aucun périphérique de capture détecté !" --width=300
     exit 1
 fi
-echo "Nom descriptif du périphérique : $DESCRIPTIVE_NAME"
+
+# Convertir les périphériques en une liste utilisable par Zenity
+formatted_devices=$(echo "$capture_devices" | awk '{print NR ": " $0}' | sed 's/ /+/g')
+selected=$(zenity --entry --title="Sélectionnez un périphérique" \
+    --text="Choisissez un périphérique de capture :" \
+    --entry-text=$(echo "$formatted_devices") --width=600)
+
+if [ $? -ne 0 ] || [ -z "$selected" ]; then
+    zenity --info --text="Annulation par l'utilisateur." --width=300
+    exit 1
+fi
+
+# Vérification et extraction du périphérique sélectionné
+if ! [[ $(echo "$selected" | tr '_' ' ' | awk -F':+' '{print $1}') =~ ^[0-9]+$ ]]; then
+    zenity --error --text="Le périphérique sélectionné n'est pas valide." --width=300
+    exit 1
+fi
+
+# Extraire le périphérique sélectionné
+selected_device=$(echo "$selected" | tr '+' ' ' | awk -F': ' '{print $2}')
+
+# Vérification que le périphérique sélectionné existe
+if ! echo "$capture_devices" | grep -F "$selected_device"; then
+    zenity --error --text="Le périphérique sélectionné n'est pas valide." --width=300
+    exit 1
+fi
+
+# Vérifier que le périphérique a bien été récupéré
+if [ -z "$selected_device" ]; then
+    zenity --error --text="Le périphérique sélectionné n'existe pas." --width=300
+    exit 1
+fi
+
+# Afficher le périphérique sélectionné
+zenity --info --text="Vous avez sélectionné : $selected_device" --width=300
+
+# Définition des ports
+INPUT_PORT="$selected_device"
+GX_HEAD_AMP_INPUT=$(normalize_port_name "gx_head_amp:in_0")
+GX_HEAD_FX_OUTPUT_L=$(normalize_port_name "gx_head_fx:out_0")
+GX_HEAD_FX_OUTPUT_R=$(normalize_port_name "gx_head_fx:out_1")
+ARDOUR_MASTER_OUTPUT_L=$(normalize_port_name "ardour:Master/audio_out 1")
+ARDOUR_MASTER_OUTPUT_R=$(normalize_port_name "ardour:Master/audio_out 2")
+ARDOUR_GX_TRACK_INPUT_L=$(normalize_port_name "ardour:Master/audio_in 1")
+ARDOUR_GX_TRACK_INPUT_R=$(normalize_port_name "ardour:Master/audio_in 2")
+
+# Vérification et lancement de Guitarix
+if ! pgrep -x "guitarix" > /dev/null; then
+    pw-jack guitarix &
+    sleep 2
+fi
+if ! pgrep -x "guitarix" > /dev/null; then
+    zenity --error --text="Erreur : Guitarix n'a pas pu être lancé." --width=300
+    exit 1
+fi
 
 # Trouver dynamiquement les ports JACK associés au périphérique de sortie
 if detect_jack_ports "$DESCRIPTIVE_NAME:playback_FL" "$DESCRIPTIVE_NAME:playback_FR"; then
@@ -148,53 +145,120 @@ echo "Ports JACK trouvés avec succès. Continuation du script..."
 # Attendre un instant pour s'assurer que les ports sont chargés
 MAX_WAIT=10  # Attente maximale en secondes
 for i in $(seq 1 $MAX_WAIT); do
-    if pw-jack jack_lsp | grep -q "gx_head_amp"; then
+    if pw-jack jack_lsp | grep -q $(denormalize_port_name "$GX_HEAD_AMP_INPUT"); then
         break
     fi
-    echo "Attente des ports de Guitarix..."
+    echo "Attente des ports de Guitarix... ($i/$MAX_WAIT)"
     sleep 1
 done
 
-# Vérifier que les ports Guitarix sont disponibles
-if ! pw-jack jack_lsp | grep -q "gx_head_amp"; then
-    echo "Erreur : Les ports de Guitarix ne sont pas disponibles."
+# Vérifier la disponibilité des ports Guitarix
+if ! pw-jack jack_lsp | grep -q $(denormalize_port_name "$GX_HEAD_AMP_INPUT"); then
+    zenity --error --text="Erreur : L'entrée de Guitarix ($(denormalize_port_name $GX_HEAD_AMP_INPUT)) n'est pas disponible. Vérifiez que Guitarix est correctement lancé." --width=300
     exit 1
 fi
 
-# Connecter les ports JACK
-echo "Connexion des ports JACK..."
+disconnect_all_ports
 
 # Vérifier et connecter INPUT_PORT -> GX_HEAD_AMP_INPUT
-if ! pw-jack jack_lsp -c "$INPUT_PORT" | grep -q "$GX_HEAD_AMP_INPUT"; then
-    if pw-jack jack_connect "$INPUT_PORT" "$GX_HEAD_AMP_INPUT"; then
-        echo "Connexion réussie : '$INPUT_PORT' -> '$GX_HEAD_AMP_INPUT'"
-    else
-        echo "Erreur lors de la connexion : '$INPUT_PORT' -> '$GX_HEAD_AMP_INPUT'"
-    fi
+echo "Tentative de connexion : $INPUT_PORT -> $(denormalize_port_name $GX_HEAD_AMP_INPUT)"
+if ! pw-jack jack_connect "$INPUT_PORT" $(denormalize_port_name "$GX_HEAD_AMP_INPUT"); then
+    zenity --error --text="Erreur : Impossible de connecter la guitare ($INPUT_PORT) à l'entrée de Guitarix ($(denormalize_port_name $GX_HEAD_AMP_INPUT))." --width=300
+    exit 1
 else
-    echo "Connexion déjà existante : '$INPUT_PORT' -> '$GX_HEAD_AMP_INPUT'"
+    echo "Connexion réussie : $(denormalize_port_name $INPUT_PORT) -> $(denormalize_port_name $GX_HEAD_AMP_INPUT)"
 fi
 
-# Vérifier et connecter GX_HEAD_FX_OUTPUT_L -> OUTPUT_PORT_L
-if ! pw-jack jack_lsp -c "$GX_HEAD_FX_OUTPUT_L" | grep -q "$OUTPUT_PORT_L"; then
-    if pw-jack jack_connect "$GX_HEAD_FX_OUTPUT_L" "$OUTPUT_PORT_L"; then
-        echo "Connexion réussie : '$GX_HEAD_FX_OUTPUT_L' -> '$OUTPUT_PORT_L'"
-    else
-        echo "Erreur lors de la connexion : '$GX_HEAD_FX_OUTPUT_L' -> '$OUTPUT_PORT_L'"
-    fi
-else
-    echo "Connexion déjà existante : '$GX_HEAD_FX_OUTPUT_L' -> '$OUTPUT_PORT_L'"
+# Sélection de la méthode de connexion
+CHOICE=$(zenity --entry --title="Sélectionnez un périphérique" \
+    --text="Choisissez la méthode de connexion :" \
+    --entry-text="Connexion directe via Guitarix" "Passer par Ardour" --width=600)
+
+
+
+if [ -z "$OUTPUT_PORT_L" ] || [ -z "$OUTPUT_PORT_R" ]; then
+    zenity --error --text="Erreur : Les ports de sortie ne sont pas définis correctement. Vérifiez votre configuration." --width=400
+    exit 1
 fi
 
-# Vérifier et connecter GX_HEAD_FX_OUTPUT_R -> OUTPUT_PORT_R
-if ! pw-jack jack_lsp -c "$GX_HEAD_FX_OUTPUT_R" | grep -q "$OUTPUT_PORT_R"; then
-    if pw-jack jack_connect "$GX_HEAD_FX_OUTPUT_R" "$OUTPUT_PORT_R"; then
-        echo "Connexion réussie : '$GX_HEAD_FX_OUTPUT_R' -> '$OUTPUT_PORT_R'"
-    else
-        echo "Erreur lors de la connexion : '$GX_HEAD_FX_OUTPUT_R' -> '$OUTPUT_PORT_R'"
+OUTPUT_PORT_L=$(normalize_port_name "$OUTPUT_PORT_L")
+OUTPUT_PORT_R=$(normalize_port_name "$OUTPUT_PORT_R")
+
+if [ "$CHOICE" == "Connexion directe via Guitarix" ]; then
+
+    ports=( \
+        "$GX_HEAD_FX_OUTPUT_L:$OUTPUT_PORT_L" \
+        "$GX_HEAD_FX_OUTPUT_R:$OUTPUT_PORT_R" \
+    )
+elif [ "$CHOICE" == "Passer par Ardour" ]; then
+    # Lancer Ardour avec PipeWire
+    pw-jack /usr/bin/ardour &
+    zenity --info --text="Ardour a été lancé. Veuillez :
+1. Créer ou ouvrir un projet.
+2. Ajouter au moins une piste audio.\n\nAppuyez sur OK lorsque vous êtes prêt à continuer." --width=400
+
+    # Attendre que l'utilisateur configure Ardour
+    MAX_WAIT=300  # 5 minutes maximum
+    for i in $(seq 1 $MAX_WAIT); do
+        ardour_ports=$(pw-jack jack_lsp | grep -E "ardour:.*audio_in")
+        if [ -n "$ardour_ports" ]; then
+            echo "Ports d'entrée audio d'Ardour détectés après $i secondes."
+            break
+        fi
+        if [ "$i" -eq "$MAX_WAIT" ]; then
+            zenity --error --text="Erreur : Aucun port d'entrée audio détecté dans Ardour après 5 minutes. Assurez-vous qu'un projet est ouvert et contient au moins une piste audio." --width=400
+            exit 1
+        fi
+        echo "Attente des ports d'Ardour... ($i/$MAX_WAIT)"
+        sleep 1
+    done
+
+    # Normaliser les noms de ports pour Zenity
+    declare -A port_mapping
+    normalized_ports=""
+    while read -r port; do
+        normalized_name=$(echo "$port" | sed 's/[ /]/_/g')  # Remplace espaces et / par _
+        port_mapping["$normalized_name"]="$port"           # Map normalisé -> original
+        normalized_ports+="$normalized_name "
+    done <<< "$ardour_ports"
+
+    # Afficher les ports disponibles dans un menu Zenity
+    selected_normalized=$(zenity --list --title="Sélectionnez une entrée audio" \
+        --text="Voici les pistes audio disponibles dans Ardour. Sélectionnez celle à associer à la guitare." \
+        --column="Port Audio" $normalized_ports --width=500 --height=300)
+
+    if [ -z "$selected_normalized" ]; then
+        zenity --error --text="Aucune entrée audio sélectionnée. Veuillez choisir une entrée valide." --width=300
+        exit 1
     fi
-else
-    echo "Connexion déjà existante : '$GX_HEAD_FX_OUTPUT_R' -> '$OUTPUT_PORT_R'"
+
+    # Récupérer le port original correspondant au nom normalisé
+    selected_port="${port_mapping[$selected_normalized]}"
+    zenity --info --text="Vous avez sélectionné : $selected_port" --width=300
+    normalized_selected_port=$(normalize_port_name "$selected_port")
+
+    # Connexions :
+    # - Sortie de Guitarix vers l'entrée audio sélectionnée
+    # - Sorties Master d'Ardour vers les sorties système
+
+    echo "Connexion de Guitarix à Ardour :"
+    echo "Connexion des sorties Master d'Ardour au système :"
+    ports=( \
+        "$GX_HEAD_FX_OUTPUT_L:$normalized_selected_port" \
+        "$ARDOUR_MASTER_OUTPUT_L:$OUTPUT_PORT_L" \
+        "$ARDOUR_MASTER_OUTPUT_R:$OUTPUT_PORT_R" \
+    )
+
+    zenity --info --text="Les connexions ont été établies avec succès !" --width=300
 fi
 
-echo "Configuration terminée. Guitarix est prêt à être utilisé."
+# Établir les connexions
+for pair in "${ports[@]}"; do
+    src="${pair%%:*}"
+    dst="${pair##*:}"
+    normalized_src=$(denormalize_port_name "$src")
+    normalized_dst=$(denormalize_port_name "$dst")
+    connect_ports "$normalized_src" "$normalized_dst"
+done
+
+zenity --info --text="Les connexions ont été établies avec succès !" --width=300
